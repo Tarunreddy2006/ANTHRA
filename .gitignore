@@ -7,5 +7,6 @@ venv/
 env/
 ecosync_env/
 outputs/
+.md
 *.log
 yolov8n.pt
