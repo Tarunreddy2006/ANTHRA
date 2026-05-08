@@ -12,10 +12,8 @@ import asyncio
 import numpy as np
 import cv2
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
 
 # Import EcoSync Modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -48,23 +46,29 @@ class PrototypeState:
         self.agent_epsilon = 0.0
         self.oracle_mode = "WARMUP"
         
+        # Accumulators for CO2 calculation
         self.total_co2_baseline = 0.0
         self.total_co2_ai = 0.0
         self.total_wait_baseline = 0.0
         self.total_wait_ai = 0.0
 
+        # ── Feature 1: Vehicle Throughput Tracking ────────────────────────
+        self.vehicle_throughput = {"N": 0, "S": 0, "E": 0, "W": 0}  # cumulative per direction
+        self.total_vehicles_passed = 0
+        self.congestion_risk = {}  # per lane_id: "LOW" | "MEDIUM" | "HIGH"
+
+        # ── Feature 2: EV vs Fuel CO2 Tracking ────────────────────────────
+        self.ev_count_live = 0
+        self.fuel_count_live = 0
+        self.co2_rate_live = 0.0   # g/km for current frame vehicles
+        self.cumulative_co2_fuel = 0.0   # g/km accumulated from fuel vehicles
+        self.cumulative_co2_saved_ev = 0.0  # g/km that EVs did NOT emit
+
+        # ── Feature 3: Ambulance Emergency State ──────────────────────────
+        self.ambulance_active = False
+        self.ambulance_alert_msg = ""
+
 state = PrototypeState()
-app = FastAPI(title="EcoSync API")
-
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── Background Logic ──────────────────────────────────────────────────────
 
 def run_ecosync_loop():
     print("🚀 Initializing EcoSync FastAPI Prototype...")
@@ -73,6 +77,7 @@ def run_ecosync_loop():
     cfg.SUMO_BINARY = "sumo" 
     cfg.SIM_STEPS = 999999   
     
+    # 2. Init Perception (FileCapture via video_path)
     video_path = "traffic_video.mp4"    
     if not os.path.exists(video_path):
         out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), 15.0, (640, 480))
@@ -88,6 +93,7 @@ def run_ecosync_loop():
     )
     bridge.start()
     
+    # 3. Init Strategist & Oracle
     strategist = EcoSyncStrategist(config=cfg)
     
     if os.path.exists(cfg.DEPLOY_MODEL):
@@ -97,6 +103,9 @@ def run_ecosync_loop():
     obs, _ = strategist.env.reset()
     done = False
     
+    # Track which frame IDs we've already counted to avoid double-counting
+    last_counted_frame_id = -1
+
     while not done:
         if not state.running:
             time.sleep(0.1)
@@ -104,6 +113,10 @@ def run_ecosync_loop():
             
         t0 = time.time()
         bridge.set_sim_time(float(strategist.env._sim_step))
+        with state.lock:
+            night, fog, rain = state.night_active, state.fog_active, state.rain_active
+        bridge.set_atmospheric_modes(night, fog, rain)
+        strategist.env.set_atmospheric_modes(night, fog, rain)
         
         action = strategist.agent.select_action(obs, training=False)
         next_obs, reward, terminated, truncated, info = strategist.env.step(action)
@@ -140,12 +153,11 @@ def run_ecosync_loop():
             state.agent_epsilon = strategist.agent.epsilon
             state.oracle_mode = oracle_mode.upper()
             state.lane_data = live_data
-            
+
             if b64_img:
                 state.base64_frame = b64_img
             state.lstm_predictions = oracle_preds
             
-            # Impact Calculations
             current_co2 = info["emissions"]
             state.total_co2_ai += current_co2
             state.total_co2_baseline += current_co2 * 1.35
@@ -169,32 +181,35 @@ def run_ecosync_loop():
             
             pred_count = sum(p["predicted_counts"][-1] for p in oracle_preds.values() if p["predicted_counts"]) if oracle_preds else 0
             state.density_predicted.append(pred_count)
+            if len(state.density_predicted) > 60:
+                state.density_predicted.pop(0)
             
-            # Log Management
-            reason = "🚨 EMERGENCY GREEN CORRIDOR" if info.get("emergency_corridor_active") else f"Optimization (R={reward:.2f})"
-            state.log_entries.append({"step": state.step, "action": cfg.PHASES.get(state.rl_phase, str(state.rl_phase)), "reason": reason})
-            
-            if len(state.density_actual) > 60: state.density_actual.pop(0)
-            if len(state.density_predicted) > 60: state.density_predicted.pop(0)
-            if len(state.log_entries) > 50: state.log_entries.pop(0)
+            if info.get("emergency_corridor_active"):
+                reason = "🚨 EMERGENCY GREEN CORRIDOR ACTIVATED"
+            else:
+                reason = f"Normal optimization (R={reward:.2f})"
+                
+            state.log_entries.append({
+                "step": state.step,
+                "action": cfg.PHASES.get(state.rl_phase, str(state.rl_phase)),
+                "reason": reason
+            })
+            if len(state.log_entries) > 50:
+                state.log_entries.pop(0)
 
         elapsed = time.time() - t0
         time.sleep(max(0.0, 0.1 - elapsed))
         
     bridge.stop()
     strategist.close()
+    print("🛑 Prototype Loop Stopped.")
 
-# Start background thread
-threading.Thread(target=run_ecosync_loop, daemon=True).start()
+bg_thread = threading.Thread(target=run_ecosync_loop, daemon=True)
+bg_thread.start()
 
-# ── API Endpoints ────────────────────────────────────────────────────────
-
-class ControlRequest(BaseModel):
-    running: bool
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return FileResponse("index.html")
+@app.route("/")
+def index():
+    return send_from_directory(".", "index.html")
 
 @app.get("/api/state")
 async def get_state():
@@ -213,13 +228,15 @@ async def get_state():
             "log_entries": state.log_entries,
             "lane_data": state.lane_data,
             "yolo_frame_base64": state.base64_frame
-        }
+        })
 
-@app.post("/api/control")
-async def control_system(data: ControlRequest):
-    with state.lock:
-        state.running = data.running
-    return {"running": state.running}
+@app.route("/api/control", methods=["POST"])
+def api_control():
+    data = request.get_json(force=True, silent=True) or {}
+    if "running" in data:
+        with state.lock:
+            state.running = bool(data["running"])
+    return jsonify({"running": state.running})
 
 if __name__ == "__main__":
     import uvicorn
