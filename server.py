@@ -1,19 +1,21 @@
 """
-EcoSync — Flask API Backend (Video-Driven Production Prototype)
-Integrates YOLO, LSTM, and RL into a single real-time server.
+EcoSync — FastAPI Backend (Video-Driven Production Prototype)
+Refactored for high-performance asynchronous operations.
 """
 
 import os
 import sys
 import time
-import math
 import base64
 import threading
+import asyncio
 import numpy as np
 import cv2
 
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Import EcoSync Modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -21,10 +23,7 @@ from strategy import EcoSyncStrategist, Config
 from perception import build_perception_pipeline
 from traffic_oracle import TrafficOracle
 
-# ── Global State & Background Loop ──────────────────────────────────────────
-
-app = Flask(__name__, static_folder=".")
-CORS(app)
+# ── Global State ──────────────────────────────────────────────────────────
 
 class PrototypeState:
     def __init__(self):
@@ -40,7 +39,8 @@ class PrototypeState:
         self.metrics = {
             "wait_pct": 0.0, "wait_abs": 0.0,
             "emissions_pct": 0.0, "emissions_abs": 0.0,
-            "jam_pct": 0.0, "jam_abs": 0.0
+            "jam_pct": 0.0, "jam_abs": 0.0,
+            "ev_count": 0
         }
         self.density_actual = []
         self.density_predicted = []
@@ -48,26 +48,33 @@ class PrototypeState:
         self.agent_epsilon = 0.0
         self.oracle_mode = "WARMUP"
         
-        # Accumulators for CO2 calculation
         self.total_co2_baseline = 0.0
         self.total_co2_ai = 0.0
         self.total_wait_baseline = 0.0
         self.total_wait_ai = 0.0
 
 state = PrototypeState()
+app = FastAPI(title="EcoSync API")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Background Logic ──────────────────────────────────────────────────────
 
 def run_ecosync_loop():
-    print("🚀 Initialising EcoSync Video-Driven Prototype...")
+    print("🚀 Initializing EcoSync FastAPI Prototype...")
     
-    # 1. Init Configuration
     cfg = Config()
-    cfg.SUMO_BINARY = "sumo" # Run headless if TraCI is still active in strategy.py
-    cfg.SIM_STEPS = 999999   # Run indefinitely for the prototype
+    cfg.SUMO_BINARY = "sumo" 
+    cfg.SIM_STEPS = 999999   
     
-    # 2. Init Perception (FileCapture via video_path)
     video_path = "traffic_video.mp4"    
     if not os.path.exists(video_path):
-        print(f"⚠️  WARNING: {video_path} not found. Creating a dummy black video for testing...")
         out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), 15.0, (640, 480))
         for _ in range(60):
             out.write(np.zeros((480, 640, 3), dtype=np.uint8))
@@ -81,11 +88,7 @@ def run_ecosync_loop():
     )
     bridge.start()
     
-    # 3. Init Strategist & Oracle
     strategist = EcoSyncStrategist(config=cfg)
-    
-    # 4. Start Deployment Loop
-    print("▶️  Starting Prototype Loop...")
     
     if os.path.exists(cfg.DEPLOY_MODEL):
         strategist.agent.load(cfg.DEPLOY_MODEL)
@@ -100,26 +103,23 @@ def run_ecosync_loop():
             continue
             
         t0 = time.time()
-        
         bridge.set_sim_time(float(strategist.env._sim_step))
         
-        # RL Step
         action = strategist.agent.select_action(obs, training=False)
         next_obs, reward, terminated, truncated, info = strategist.env.step(action)
         obs = next_obs
         done = terminated or truncated
         
-        # Extract YOLO Data & Frame
         latest_frames = bridge.get_latest_frame_data(n=1)
         b64_img = ""
         live_data = bridge.get_live_traffic_data() or {}
+        
         if latest_frames and latest_frames[0].raw_frame is not None:
             frame = latest_frames[0].raw_frame.copy()
             vis_frame = engine.visualise(frame, latest_frames[0])
             _, buffer = cv2.imencode('.jpg', vis_frame)
             b64_img = base64.b64encode(buffer).decode('utf-8')
             
-        # Extract Oracle Predictions
         oracle_preds = {}
         oracle_mode = "WARMUP"
         if strategist.env.oracle is not None:
@@ -145,6 +145,7 @@ def run_ecosync_loop():
                 state.base64_frame = b64_img
             state.lstm_predictions = oracle_preds
             
+            # Impact Calculations
             current_co2 = info["emissions"]
             state.total_co2_ai += current_co2
             state.total_co2_baseline += current_co2 * 1.35
@@ -155,60 +156,50 @@ def run_ecosync_loop():
             state.total_wait_baseline += current_wait * 1.25
             wait_saved = max(0.0, state.total_wait_baseline - state.total_wait_ai)
             
-            state.metrics["wait_abs"] = wait_saved
-            state.metrics["wait_pct"] = (wait_saved / max(1, state.total_wait_baseline)) * 100
-            state.metrics["emissions_abs"] = state.co2_saved
-            state.metrics["emissions_pct"] = (state.co2_saved / max(1, state.total_co2_baseline)) * 100
-            
-            if latest_frames:
-                state.metrics["ev_count"] = latest_frames[0].total_evs
-            else:
-                state.metrics["ev_count"] = 0
+            state.metrics.update({
+                "wait_abs": wait_saved,
+                "wait_pct": (wait_saved / max(1, state.total_wait_baseline)) * 100,
+                "emissions_abs": state.co2_saved,
+                "emissions_pct": (state.co2_saved / max(1, state.total_co2_baseline)) * 100,
+                "ev_count": latest_frames[0].total_evs if latest_frames else 0
+            })
             
             current_count = sum(d.get("count", 0) for d in live_data.values())
             state.density_actual.append(current_count)
-            if len(state.density_actual) > 60:
-                state.density_actual.pop(0)
-                
-            pred_count = 0
-            if oracle_preds:
-                pred_count = sum(p["predicted_counts"][-1] for p in oracle_preds.values() if p["predicted_counts"])
-            state.density_predicted.append(pred_count)
-            if len(state.density_predicted) > 60:
-                state.density_predicted.pop(0)
             
-            if info.get("emergency_corridor_active"):
-                reason = "🚨 EMERGENCY GREEN CORRIDOR ACTIVATED"
-            else:
-                reason = f"Normal optimization (R={reward:.2f})"
-                
-            state.log_entries.append({
-                "step": state.step,
-                "action": cfg.PHASES.get(state.rl_phase, str(state.rl_phase)),
-                "reason": reason
-            })
-            if len(state.log_entries) > 50:
-                state.log_entries.pop(0)
+            pred_count = sum(p["predicted_counts"][-1] for p in oracle_preds.values() if p["predicted_counts"]) if oracle_preds else 0
+            state.density_predicted.append(pred_count)
+            
+            # Log Management
+            reason = "🚨 EMERGENCY GREEN CORRIDOR" if info.get("emergency_corridor_active") else f"Optimization (R={reward:.2f})"
+            state.log_entries.append({"step": state.step, "action": cfg.PHASES.get(state.rl_phase, str(state.rl_phase)), "reason": reason})
+            
+            if len(state.density_actual) > 60: state.density_actual.pop(0)
+            if len(state.density_predicted) > 60: state.density_predicted.pop(0)
+            if len(state.log_entries) > 50: state.log_entries.pop(0)
 
         elapsed = time.time() - t0
-        sleep_t = max(0.0, 0.1 - elapsed)
-        time.sleep(sleep_t)
+        time.sleep(max(0.0, 0.1 - elapsed))
         
     bridge.stop()
     strategist.close()
-    print("🛑 Prototype Loop Stopped.")
 
-bg_thread = threading.Thread(target=run_ecosync_loop, daemon=True)
-bg_thread.start()
+# Start background thread
+threading.Thread(target=run_ecosync_loop, daemon=True).start()
 
-@app.route("/")
-def index():
-    return send_from_directory(".", "index.html")
+# ── API Endpoints ────────────────────────────────────────────────────────
 
-@app.route("/api/state")
-def api_state():
+class ControlRequest(BaseModel):
+    running: bool
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return FileResponse("index.html")
+
+@app.get("/api/state")
+async def get_state():
     with state.lock:
-        return jsonify({
+        return {
             "step": state.step,
             "running": state.running,
             "oracle_mode": state.oracle_mode,
@@ -222,19 +213,18 @@ def api_state():
             "log_entries": state.log_entries,
             "lane_data": state.lane_data,
             "yolo_frame_base64": state.base64_frame
-        })
+        }
 
-@app.route("/api/control", methods=["POST"])
-def api_control():
-    data = request.get_json(force=True, silent=True) or {}
-    if "running" in data:
-        with state.lock:
-            state.running = bool(data["running"])
-    return jsonify({"running": state.running})
+@app.post("/api/control")
+async def control_system(data: ControlRequest):
+    with state.lock:
+        state.running = data.running
+    return {"running": state.running}
 
 if __name__ == "__main__":
+    import uvicorn
     print("=" * 60)
-    print("  EcoSync Final Integration Server")
+    print("  EcoSync Final Integration Server (FastAPI)")
     print("  Open: http://localhost:5000")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

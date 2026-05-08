@@ -132,8 +132,8 @@ DEFAULT_LANE_IDS: List[str] = [
 ]
 
 # YOLOv8 inference settings (tuned for real-time on CPU/GPU)
-YOLO_MODEL_NAME: str  = "yolov8n.pt"   # Nano — fastest; swap to yolov8s for +mAP
-YOLO_CONF_THRESH: float = 0.35          # lower = more detections, more FP
+YOLO_MODEL_NAME: str  = "yolov8s.pt"   # Nano — fastest; swap to yolov8s for +mAP
+YOLO_CONF_THRESH: float = 0.25          # lower = more detections, more FP
 YOLO_IOU_THRESH:  float = 0.45          # NMS overlap threshold
 YOLO_IMG_SIZE:    int   = 640           # inference resolution
 
