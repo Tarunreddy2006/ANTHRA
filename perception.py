@@ -1,28 +1,4 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║        EcoSync — Phase 2: YOLOv8 Perception Engine                          ║
-║        Trigger V.1 Hackathon  |  Hybrid YOLO-LSTM-RL Traffic System         ║
-║        Senior Computer Vision Engineer                                        ║
-╚══════════════════════════════════════════════════════════════════════════════╝
 
-Architecture:
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │  ScreenCapture      → mss-based zero-copy SUMO-GUI frame grabber        │
-  │  ROIManager         → Polygonal lane masks with Shapely / cv2            │
-  │  EmissionsScorer    → Per-class CO2 / NOx proxy weights                  │
-  │  YOLOPerceptionEngine → Full pipeline: capture → detect → classify       │
-  │  PerceptionBridge   → Thread-safe adapter for LSTM (Phase 3) / RL        │
-  └─────────────────────────────────────────────────────────────────────────┘
-
-Phase 3 / 4 hooks:
-  • PerceptionBridge.get_latest_frame_data() → list of FrameData (ring buffer)
-  • YOLOPerceptionEngine.process_frame()     → single-frame dict (sync call)
-  • All outputs are typed dataclasses — drop-in for LSTM sequence builder
-"""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Standard library
-# ─────────────────────────────────────────────────────────────────────────────
 import os
 import sys
 import time
